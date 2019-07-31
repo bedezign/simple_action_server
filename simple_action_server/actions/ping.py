@@ -21,4 +21,4 @@ def any(request: RequestHandler,
     :param form: Any posted form fields as a dict keyed by the field name with a list of FieldStorage instances as value
     :param files: Any posted files, "
     """
-    request.success('Pong', content="Blah")
+    request.success('Pong', content="Pong")

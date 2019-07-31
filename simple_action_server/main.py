@@ -271,7 +271,7 @@ class ActionRequestHandler(SimpleHTTPRequestHandler, metaclass=ActionRequestHand
                         for prefix in prefixes:
                             try_function = '_'.join([prefix, function]).lstrip('_')
                             if hasattr(module, try_function):
-                                return self._save_action(action_name, getattr(module, try_function), \
+                                return self._save_action(action_name, getattr(module, try_function),
                                                          'direct' if not remainder else 'fallback')
 
                         if not self._fallback:
@@ -296,7 +296,7 @@ class ActionRequestHandler(SimpleHTTPRequestHandler, metaclass=ActionRequestHand
                 return self._save_action(action_name, method, 'catchall')
 
         # Do we have 404 actions?
-        for prefix in [self.command, 'ANY', '']:
+        for prefix in [self.command, 'ANY']:
             name = ' '.join([prefix, '404']).strip()
             if name in self._actions:
                 return Action(self._actions[name], 'error')
