@@ -102,6 +102,7 @@ class ActionRequestHandler(SimpleHTTPRequestHandler, metaclass=ActionRequestHand
         self._file_path = None
         self._mime_type = None
         self._parsed_url = None
+        self._response_sent = False
         super().__init__(*args, **kwargs)
 
     def do_GET(self):
@@ -233,6 +234,12 @@ class ActionRequestHandler(SimpleHTTPRequestHandler, metaclass=ActionRequestHand
         else:
             logger.error("No action for [%s %s]" % (self.command, self.parsed_url.path))
             self.send_404()
+
+    def send_response(self, code, message=None):
+        """Limit response sending to once"""
+        if not self._response_sent:
+            self._response_sent = True
+            super().send_response(code, message)
 
     def send_404(self):
         self.send_error(HTTPStatus.NOT_FOUND)
@@ -427,7 +434,7 @@ def serve(host_name: str = '', host_port: int = 8080, actions: dict = None, acti
     ActionRequestHandler.action_sources = action_sources
 
     server = HTTPServer((host_name, host_port), ActionRequestHandler)
-    logger.debug("START - %s:%s" % (host_name, host_port))
+    logger.info("START - %s:%s" % (host_name, host_port))
 
     try:
         server.serve_forever()
@@ -435,4 +442,4 @@ def serve(host_name: str = '', host_port: int = 8080, actions: dict = None, acti
         pass
 
     server.server_close()
-    logger.debug("STOP - %s:%s" % (host_name, host_port))
+    logger.info("END - %s:%s" % (host_name, host_port))
