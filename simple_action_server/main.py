@@ -3,10 +3,12 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 from http import HTTPStatus
 from http.server import __version__ as http_version, HTTPServer, SimpleHTTPRequestHandler  # noqa
 # Use from..import for importlib as it needs to bootstrap some stuff before  "util" etc works, which import doesn't do
 from importlib import import_module, util as importlib_util
+from time import sleep
 from typing import AnyStr, Callable, Optional
 from urllib.parse import parse_qs, ParseResult, urlparse
 
@@ -44,6 +46,8 @@ class ActionRequestHandlerMeta(type):
         cls._action_sources = []
         cls._actions = {}
         cls._fallback = False
+        cls._exceptions = None
+        cls._multi_threaded = False
         super().__init__(*args, **kwargs)
 
     @property
@@ -93,6 +97,9 @@ class ActionRequestHandlerMeta(type):
         """
         cls._fallback = status
 
+    def exception_handler(cls, handler: Callable):
+        cls._exceptions = handler
+
 
 class ActionRequestHandler(SimpleHTTPRequestHandler, metaclass=ActionRequestHandlerMeta):
     _action_modules = None
@@ -109,13 +116,21 @@ class ActionRequestHandler(SimpleHTTPRequestHandler, metaclass=ActionRequestHand
         self._dispatch()
 
     def do_POST(self):
-        fields = cgi.FieldStorage(self.rfile, self.headers, environ={'REQUEST_METHOD': 'POST'})
         form = {}
         files = {}
-        for f in fields.list:
-            target = files if f.filename else form
-            # Since HTTP allows for the same field to be present multiple times, add as list
-            target.setdefault(f.name, []).append(f)
+        if self.headers['content-type'].endswith('/json'):
+            # Support json posts as well, fake cgi fields
+            import json
+            content_len = int(self.headers.get('content-length', 0))
+            content = json.loads(self.rfile.read(content_len))
+            for k, v in content.items():
+                form.setdefault(k, []).append(cgi.MiniFieldStorage(k, v))
+        else:
+            fields = cgi.FieldStorage(self.rfile, self.headers, environ={'REQUEST_METHOD': 'POST'})
+            for f in fields.list:
+                target = files if f.filename else form
+                # Since HTTP allows for the same field to be present multiple times, add as list
+                target.setdefault(f.name, []).append(f)
 
         self._dispatch(form, files)
 
@@ -125,7 +140,7 @@ class ActionRequestHandler(SimpleHTTPRequestHandler, metaclass=ActionRequestHand
     def do_PUT(self):
         self._dispatch()
 
-    def send_json(self, path=None, content=None):
+    def send_json(self, content=None, path=None):
         """
         Shortcut function to send a json file back to the client
         :param path: Physical path on the disk if this is a pre-existing file
@@ -230,7 +245,19 @@ class ActionRequestHandler(SimpleHTTPRequestHandler, metaclass=ActionRequestHand
             if files:
                 parameters['files'] = files
 
-            action(self, **parameters)
+            def worker():
+                try:
+                    action(self, **parameters)
+                except Exception as e:
+                    if self._exceptions:
+                        arguments = {'request': self, 'exc_info': sys.exc_info(), 'original_handler': action}
+                        arguments.update(parameters)
+                        self._exceptions(**arguments)
+
+            if self._multi_threaded:
+                threading.Thread(target=worker).run()
+            else:
+                worker()
         else:
             logger.error("No action for [%s %s]" % (self.command, self.parsed_url.path))
             self.send_404()
@@ -332,27 +359,12 @@ class ActionRequestHandler(SimpleHTTPRequestHandler, metaclass=ActionRequestHand
 
         parts = list(parts)
         (module, origin) = self._action_modules[identifier]
-        if origin == 'module':
-            while parts:
-                part = parts.pop(0)
-                try:
-                    name = module.__name__ + '.' + part
-                    # Always load starting from the base module so relative imports work
-                    spec = importlib_util.find_spec(name)  # noqa
-                    if not spec:
-                        parts.insert(0, part)
-                        break
-                except (ModuleNotFoundError, ValueError):
-                    # Put part back in list
-                    parts.insert(0, part)
-                    break
 
-                try:
-                    module = spec.loader.load_module()
-                except Exception as e:
-                    logger.warning('Unable to load module "%s" : Coding error? Exception was: ' % name + repr(e))
-                    parts.insert(0, part)
-                    break
+        if origin == 'module':
+            (module, loaded_parts) = self._load_sub_module(module, parts)
+            if isinstance(loaded_parts, str):
+                loaded_parts = loaded_parts.split('.')
+            parts = parts[len(loaded_parts) if loaded_parts else 0:]
 
         elif origin == 'path':
             # See how "low" we can go directory-wise first
@@ -378,6 +390,39 @@ class ActionRequestHandler(SimpleHTTPRequestHandler, metaclass=ActionRequestHand
                 return getattr(module, method)
 
     @classmethod
+    def _load_sub_module(cls, module, segments):
+        parts = segments.split('.') if isinstance(segments, str) else segments
+
+        take_away = 0
+        if isinstance(module, tuple):
+            # Tuple means we're messing with submodules here because an action module path was specified
+            new_parts = module[3].split('.')
+            take_away = len(new_parts)
+            new_parts.extend(parts)
+            parts = new_parts
+            module = module[1]
+
+        new_module = None
+        while parts:
+            name = module.__package__ + '.' + '.'.join(parts)
+            try:
+                # Currently this refuses to load packages/modules containing relative imports, even with package= set
+                # Need to figure out how to best handle that but haven't found a way yet
+                new_module = import_module(name)
+                break
+            except ModuleNotFoundError as e:
+                logger.debug('Tried "%s", but got "not found" (%r)' % (name, e))
+                parts.pop()
+            except Exception as e:
+                logger.warning('Unable to load module "%s" : Coding error? Exception was: %r' % (name, e))
+                parts.pop()
+
+        if parts and take_away:
+            parts = parts[take_away:]
+
+        return new_module, '.'.join(parts) if parts else None
+
+    @classmethod
     def _load_action_modules(cls):
         """
         Given a list of action sources, load the top level modules for each
@@ -390,6 +435,7 @@ class ActionRequestHandler(SimpleHTTPRequestHandler, metaclass=ActionRequestHand
         for item in cls.action_sources:
             name = None
             path = None
+            actions = None
             if isinstance(item, dict):
                 if 'module' in item:
                     name = item['module']
@@ -397,15 +443,29 @@ class ActionRequestHandler(SimpleHTTPRequestHandler, metaclass=ActionRequestHand
                     name = item['package']
                 elif 'path' in item:
                     path = item['path']
+
+                if 'actions' in item:
+                    actions = item['actions'].strip('.')
             elif isinstance(item, str):
                 # String = module/package identifier
                 name = item
 
             try:
                 if name:
-                    spec = importlib_util.find_spec(item)  # noqa
+                    spec = importlib_util.find_spec(name)  # noqa
                     if spec:
-                        cls._action_modules[name] = (spec.loader.load_module(), 'module')
+                        module = spec.loader.load_module()
+                        if actions:
+                            # If an actions sub module was specified, load it based on the main modul;e
+                            (new_module, path) = cls._load_sub_module(module, actions)
+                            if path == actions:
+                                # Only register as active if we managed to load the full path
+                                cls._action_modules[name] = ((new_module, module, spec, path), 'module')
+                            else:
+                                logger.error('Unable to load "%s"-actions sub-module for "%s"'
+                                             ' ("%s" loaded): ignoring module' % (actions, name, path))
+                        else:
+                            cls._action_modules[name] = (module, 'module')
                 elif path:
                     # Load from path physical path...
                     abs_path = os.path.abspath(path)
@@ -413,7 +473,7 @@ class ActionRequestHandler(SimpleHTTPRequestHandler, metaclass=ActionRequestHand
                     cls._action_modules[path] = (import_module(os.path.basename(abs_path)), 'path')
 
             except ModuleNotFoundError:
-                pass
+                logger.error('Unable to load module "%s"' % name)
 
 
 def serve(host_name: str = '', host_port: int = 8080, actions: dict = None, action_sources: list = None):
@@ -426,11 +486,10 @@ def serve(host_name: str = '', host_port: int = 8080, actions: dict = None, acti
                            looked for.
     :return:
     """
-
     if actions:
         ActionRequestHandler.actions = actions
 
-    action_sources = action_sources if action_sources else [] + ['.'.join(__name__.split('.')[:-1]) + '.actions']
+    action_sources = action_sources if action_sources else ['.'.join(__name__.split('.')[:-1]) + '.actions']
     ActionRequestHandler.action_sources = action_sources
 
     server = HTTPServer((host_name, host_port), ActionRequestHandler)
@@ -443,3 +502,6 @@ def serve(host_name: str = '', host_port: int = 8080, actions: dict = None, acti
 
     server.server_close()
     logger.info("END - %s:%s" % (host_name, host_port))
+
+if __name__ == '__main__':
+    serve()
